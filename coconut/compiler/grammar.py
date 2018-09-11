@@ -344,6 +344,35 @@ def pipe_handle(loc, tokens, **kwargs):
             else:
                 raise CoconutInternalException("invalid split pipe item", split_item)
 
+        elif op == "|@>" or op == "|*@>":
+            # if this is an implicit partial, we have something to apply it to, so optimize it
+            name, split_item = pipe_item_split(item, loc)
+            star = "*" if op == "|*@>" else ""
+            if name == "expr":
+                internal_assert(len(split_item) == 1)
+                return "(await (" + split_item[0] + ")(" + star + pipe_handle(loc, tokens) + "))"
+            elif name == "partial":
+                internal_assert(len(split_item) == 3)
+                return "(" + split_item[0] + "(" + join_args((split_item[1], star + pipe_handle(loc, tokens), split_item[2])) + "))"
+            elif name == "attrgetter":
+                internal_assert(len(split_item) == 2)
+                if star:
+                    raise CoconutDeferredSyntaxError("cannot star pipe into attribute access or method call", loc)
+                return "(await (" + pipe_handle(loc, tokens) + ")." + split_item[0] + ("(" + split_item[1] + ")" if split_item[1] is not None else ")")
+            elif name == "itemgetter":
+                internal_assert(len(split_item) == 2)
+                if star:
+                    raise CoconutDeferredSyntaxError("cannot star pipe into item getting", loc)
+                op, args = split_item
+                if op == "[":
+                    return "(await (" + pipe_handle(loc, tokens) + ")[" + args + "])"
+                elif op == "$[":
+                    return "(await _coconut_igetitem(" + pipe_handle(loc, tokens) + ", " + args + "))"
+                else:
+                    raise CoconutInternalException("pipe into invalid implicit itemgetter operation", op)
+            else:
+                raise CoconutInternalException("invalid split pipe item", split_item)
+
         elif op == "<|" or op == "<*|":
             # for backwards pipes, we just reuse the machinery for forwards pipes
             star = "*" if op == "<*|" else ""
@@ -351,6 +380,14 @@ def pipe_handle(loc, tokens, **kwargs):
             if isinstance(inner_item, str):
                 inner_item = [inner_item]  # artificial pipe item
             return pipe_handle(loc, [item, "|" + star + ">", inner_item])
+
+        elif op == "<@|" or op == "<*@|":
+            # for backwards pipes, we just reuse the machinery for forwards pipes
+            star = "*" if op == "<*@|" else ""
+            inner_item = pipe_handle(loc, tokens, top=False)
+            if isinstance(inner_item, str):
+                inner_item = [inner_item]  # artificial pipe item
+            return pipe_handle(loc, [item, "|" + star + "@>", inner_item])
 
         else:
             raise CoconutInternalException("invalid pipe operator", op)
@@ -701,7 +738,7 @@ class Grammar(object):
     rbrack = Literal("]")
     lbrace = Literal("{")
     rbrace = Literal("}")
-    lbanana = ~Literal("(|)") + ~Literal("(|>)") + ~Literal("(|*>)") + Literal("(|")
+    lbanana = ~Literal("(|)") + ~Literal("(|>)") + ~Literal("(|*>)") + ~Literal("(|@>)") + ~Literal("(|*@>)") + Literal("(|")
     rbanana = Literal("|)")
     lparen = ~lbanana + Literal("(")
     rparen = Literal(")")
@@ -713,7 +750,11 @@ class Grammar(object):
     slash = ~dubslash + Literal("/")
     pipe = Literal("|>") | fixto(Literal("\u21a6"), "|>")
     star_pipe = Literal("|*>") | fixto(Literal("*\u21a6"), "|*>")
+    await_pipe = Literal("|@>") | fixto(Literal("@\u21a6"), "|@>")
+    await_star_pipe = Literal("|*@>") | fixto(Literal("*@\u21a6"), "|*@>")
     back_pipe = Literal("<|") | fixto(Literal("\u21a4"), "<|")
+    back_await_pipe = Literal("<@|") | fixto(Literal("\u21a4@"), "<@|")
+    back_await_star_pipe = Literal("<*@|") | fixto(Literal("\u21a4*@"), "<*@|")
     back_star_pipe = Literal("<*|") | fixto(Literal("\u21a4*"), "<*|")
     dotdot = (
         ~Literal("...") + ~Literal("..>") + ~Literal("..*>") + Literal("..")
@@ -725,7 +766,7 @@ class Grammar(object):
     comp_back_star_pipe = Literal("<*..") | fixto(Literal("<*\u2218"), "<*..")
     amp = Literal("&") | fixto(Literal("\u2227") | Literal("\u2229"), "&")
     caret = Literal("^") | fixto(Literal("\u22bb") | Literal("\u2295"), "^")
-    unsafe_bar = ~Literal("|>") + ~Literal("|*>") + Literal("|") | fixto(Literal("\u2228") | Literal("\u222a"), "|")
+    unsafe_bar = ~Literal("|>") + ~Literal("|*>") + ~Literal("|@>") + ~Literal("|*@>") + Literal("|") | fixto(Literal("\u2228") | Literal("\u222a"), "|")
     bar = ~rbanana + unsafe_bar
     percent = Literal("%")
     dollar = Literal("$")
@@ -830,8 +871,12 @@ class Grammar(object):
     augassign = (
         Combine(pipe + equals)
         | Combine(star_pipe + equals)
+        | Combine(await_pipe + equals)
+        | Combine(await_star_pipe + equals)
         | Combine(back_pipe + equals)
+        | Combine(back_await_pipe + equals)
         | Combine(back_star_pipe + equals)
+        | Combine(back_await_star_pipe + equals)
         | Combine(dotdot + equals)
         | Combine(comp_pipe + equals)
         | Combine(comp_back_pipe + equals)
@@ -891,7 +936,11 @@ class Grammar(object):
     op_item = (
         fixto(pipe, "_coconut_pipe")
         | fixto(star_pipe, "_coconut_star_pipe")
+        | fixto(await_pipe, "_coconut_await_pipe")
+        | fixto(await_star_pipe, "_coconut_await_star_pipe")
         | fixto(back_pipe, "_coconut_back_pipe")
+        | fixto(back_await_pipe, "_coconut_back_await_pipe")
+        | fixto(back_await_star_pipe, "_coconut_back_await_star_pipe")
         | fixto(back_star_pipe, "_coconut_back_star_pipe")
         | fixto(dotdot | comp_back_pipe, "_coconut_back_compose")
         | fixto(comp_pipe, "_coconut_forward_compose")
@@ -1178,7 +1227,7 @@ class Grammar(object):
         )
     )
 
-    pipe_op = pipe | star_pipe | back_pipe | back_star_pipe
+    pipe_op = pipe | star_pipe | back_pipe | back_star_pipe | await_pipe | await_star_pipe | back_await_pipe | back_await_star_pipe
     pipe_item = (
         # we need the pipe_op since any of the atoms could otherwise be the start of an expression
         Group(attrgetter_atom_tokens("attrgetter")) + pipe_op
